@@ -5559,6 +5559,7 @@ function renderTtPlayer(slot) {
               <button class="tt-btn" data-action="tt-prev">上一首</button>
               <button class="tt-btn tt-toggle" data-action="tt-play" id="ttPlayBtn">${ttAudio.paused ? '播放' : '暂停'}</button>
               <button class="tt-btn" data-action="tt-next">下一首</button>
+              ${castSupported() ? '<button class="tt-btn tt-cast-btn" data-action="cast-open" data-kind="music">投屏</button>' : ''}
             </div>
             <div class="tt-modes">
               ${TT_MODES.map((m) => `<button class="tt-mode-btn${tt.mode === m.id ? ' active' : ''}" data-action="tt-set-mode" data-mode="${m.id}">${m.label}</button>`).join('')}
@@ -6993,6 +6994,7 @@ function playNext() {
 function closePlayer() {
   if (!player.open) return
   persistProgress()
+  castReset('video')
   resetPlayerMedia()
   player.open = false
   player.current = null
@@ -7052,6 +7054,283 @@ function toggleFullscreen() {
     if (typeof videoEl.webkitEnterFullscreen === 'function') videoEl.webkitEnterFullscreen()
   })
 }
+
+/* ---------- DLNA 投屏 ----------
+   原生插件 GyDlna 负责 SSDP 搜索电视和 SOAP 控制，这里只管界面与状态：
+   投屏后本地播放器暂停，声音和画面交给电视；本地再点播放/暂停会同步给电视。
+   电视端只能直接拉取 http(s) 地址，本地文件需要先用系统播放器投屏。 */
+const cast = {
+  sheet: false,
+  scanning: false,
+  connecting: false,
+  active: false,
+  devices: [],
+  device: null,
+  kind: '',
+  title: '',
+  playing: false,
+  error: '',
+  mirror: false,
+  switching: false
+}
+
+function castSupported() {
+  return (
+    (GY_PLATFORM === 'android' || GY_PLATFORM === 'ios') &&
+    !!window.Capacitor &&
+    typeof window.Capacitor.nativePromise === 'function'
+  )
+}
+
+function castCall(method, args) {
+  return window.Capacitor.nativePromise('GyDlna', method, args || {})
+}
+
+function castCurrentTitle(kind) {
+  if (kind === 'music') {
+    const track = ttActiveList()[ttSlot().index]
+    if (!track) return '音乐'
+    return track.artist ? `${track.title} · ${track.artist}` : track.title
+  }
+  const item = player.current
+  if (!item) return '视频'
+  return [item.title, item.label, item.meta].filter(Boolean).join(' · ')
+}
+
+function castCurrentUrl(kind) {
+  if (kind === 'music') return ttAudio.src || ''
+  return (player.current && player.current.src) || ''
+}
+
+function castCurrentTime(kind) {
+  const value = kind === 'music' ? ttAudio.currentTime : videoEl.currentTime
+  return Number(value) || 0
+}
+
+function castOpenSheet(kind) {
+  if (!castSupported()) {
+    toast('当前版本不支持投屏')
+    return
+  }
+  cast.sheet = true
+  if (!cast.active) {
+    cast.kind = kind === 'music' ? 'music' : 'video'
+    cast.title = castCurrentTitle(cast.kind)
+  }
+  castRender()
+  if (!cast.active && !cast.scanning) castDiscover()
+}
+
+function castCloseSheet() {
+  cast.sheet = false
+  castRender()
+}
+
+function castDiscoverTip(hint) {
+  if (hint === 'no-wifi') return '手机没有连上 Wi-Fi，请先连接与电视相同的 Wi-Fi 再搜索'
+  if (hint === 'ios-local-network') {
+    return 'iPhone 没有本地网络权限：请到 设置 → 隐私与安全性 → 本地网络 中允许「娟光阅影」，然后重新搜索'
+  }
+  return '没有搜索到电视，请确认手机和电视连在同一个 Wi-Fi，并已打开电视'
+}
+
+async function castDiscover() {
+  if (!castSupported()) return
+  cast.scanning = true
+  cast.error = ''
+  cast.devices = []
+  castRender()
+  try {
+    const res = await castCall('discover', { timeout: 2600 })
+    cast.devices = (res && Array.isArray(res.devices) && res.devices) || []
+    if (!cast.devices.length) {
+      cast.error = castDiscoverTip((res && res.hint) || '')
+    }
+  } catch (err) {
+    cast.error = `搜索设备失败：${(err && err.message) || '请稍后重试'}`
+  } finally {
+    cast.scanning = false
+    castRender()
+  }
+}
+
+async function castStart(index) {
+  const device = cast.devices[index]
+  if (!device || cast.connecting) return
+  const kind = cast.kind === 'music' ? 'music' : 'video'
+  const url = castCurrentUrl(kind)
+  if (!/^https?:\/\//i.test(url)) {
+    toast(kind === 'music' ? '这首歌还没有可用的播放地址' : '本地视频不支持投屏，请改用网络片源')
+    return
+  }
+  cast.connecting = true
+  cast.error = ''
+  cast.title = castCurrentTitle(kind)
+  castRender()
+  try {
+    await castCall('cast', {
+      url,
+      title: cast.title,
+      seconds: castCurrentTime(kind),
+      type: kind,
+      tuneVolume: true,
+      device
+    })
+    cast.active = true
+    cast.playing = true
+    cast.device = device
+    castStopLocal(kind)
+    toast(`已投屏到 ${device.name || '电视'}`)
+  } catch (err) {
+    toast(`投屏失败：${(err && err.message) || '电视没有响应'}`)
+  } finally {
+    cast.connecting = false
+    castRender()
+  }
+}
+
+async function castStop(showToast) {
+  if (!cast.active) {
+    castCloseSheet()
+    return
+  }
+  try {
+    await castCall('stop')
+  } catch (_) {
+    /* 电视可能已经断开，忽略 */
+  }
+  cast.active = false
+  cast.device = null
+  cast.playing = false
+  cast.error = ''
+  if (showToast !== false) toast('已停止投屏')
+  castRender()
+}
+
+async function castToggle() {
+  if (!cast.active) return
+  const next = !cast.playing
+  try {
+    await castCall(next ? 'resume' : 'pause')
+    cast.playing = next
+    castRender()
+  } catch (_) {
+    toast('电视没有响应')
+  }
+}
+
+/** 投屏期间本地播放器只做“遥控器”：按下播放后立刻让本地静音，把地址和进度推给电视 */
+function castMirrorPlay(kind) {
+  if (!cast.active || cast.kind !== kind || cast.mirror || cast.switching) return
+  cast.switching = true
+  castStopLocal(kind)
+  const url = castCurrentUrl(kind)
+  if (/^https?:\/\//i.test(url)) {
+    castCall('cast', {
+      url,
+      title: castCurrentTitle(kind),
+      seconds: castCurrentTime(kind),
+      type: kind,
+      tuneVolume: false,
+      device: cast.device
+    })
+      .then(() => {
+        cast.playing = true
+        castRender()
+      })
+      .catch(() => toast('电视没有响应，请重新投屏'))
+  }
+  setTimeout(() => {
+    cast.switching = false
+  }, 600)
+}
+
+function castMirrorPause(kind) {
+  if (!cast.active || cast.kind !== kind || cast.mirror) return
+  cast.playing = false
+  castCall('pause').catch(() => {})
+  castRender()
+}
+
+function castStopLocal(kind) {
+  cast.mirror = true
+  try {
+    if (kind === 'music') ttAudio.pause()
+    else videoEl.pause()
+  } catch (_) {
+    /* 忽略 */
+  }
+  setTimeout(() => {
+    cast.mirror = false
+  }, 600)
+}
+
+function castReset(kind) {
+  if (cast.active && cast.kind === kind) castStop(false)
+}
+
+function castRender() {
+  const playerCastBtn = document.getElementById('playerCast')
+  if (playerCastBtn) playerCastBtn.classList.toggle('is-casting', cast.active && cast.kind === 'video')
+  // 安卓 WebView 的视频是独立渲染层，会盖住网页弹层，所以打开面板时先把画面隐藏
+  document.body.classList.toggle('cast-open', cast.sheet)
+  const sheet = document.getElementById('castSheet')
+  if (!sheet) return
+  sheet.classList.toggle('hidden', !cast.sheet)
+  const body = document.getElementById('castBody')
+  if (!body) return
+  if (!cast.sheet) return
+
+  const scanBtn = '<button class="cast-btn ghost" data-action="cast-rescan">重新搜索</button>'
+  let html = ''
+  if (cast.active) {
+    html += `<div class="cast-now">
+      <span class="cast-now-mark">投屏中</span>
+      <div class="cast-now-title">${escapeHtml(cast.title || '')}</div>
+      <div class="cast-now-device">${escapeHtml((cast.device && cast.device.name) || '电视')}</div>
+    </div>
+    <div class="cast-actions">
+      <button class="cast-btn primary" data-action="cast-toggle">${cast.playing ? '暂停' : '继续播放'}</button>
+      <button class="cast-btn ghost" data-action="cast-stop">停止投屏</button>
+    </div>
+    <div class="cast-tip">投屏期间可以在本机直接点播放/暂停，画面和声音由电视播放。</div>`
+  } else if (cast.connecting) {
+    html = '<div class="cast-empty"><span class="spinner"></span>正在连接电视…</div>'
+  } else if (cast.scanning) {
+    html = '<div class="cast-empty"><span class="spinner"></span>正在搜索同一 Wi-Fi 下的电视…</div>'
+  } else if (cast.devices.length) {
+    html = `<div class="cast-list">${cast.devices
+      .map(
+        (device, index) => `<button class="cast-device" data-action="cast-device" data-index="${index}">
+          <span class="cast-device-icon">TV</span>
+          <span class="cast-device-name">${escapeHtml(device.name || '电视')}</span>
+        </button>`
+      )
+      .join('')}</div>
+      <div class="cast-foot">${scanBtn}</div>`
+  } else {
+    html = `<div class="cast-empty">${escapeHtml(cast.error || '还没有搜索到电视')}</div>
+      <div class="cast-foot">${scanBtn}</div>`
+  }
+  body.innerHTML = html
+}
+
+function handleCastAction(action, element) {
+  if (action === 'cast-device') {
+    castStart(Number(element.dataset.index) || 0)
+  } else if (action === 'cast-stop') {
+    castStop(true)
+  } else if (action === 'cast-toggle') {
+    castToggle()
+  } else if (action === 'cast-rescan') {
+    if (!cast.scanning) castDiscover()
+  }
+}
+
+videoEl.addEventListener('play', () => castMirrorPlay('video'))
+videoEl.addEventListener('pause', () => castMirrorPause('video'))
+ttAudio.addEventListener('play', () => castMirrorPlay('music'))
+ttAudio.addEventListener('pause', () => castMirrorPause('music'))
 
 /* ---------- 全网搜索 ---------- */
 
@@ -7474,6 +7753,9 @@ async function handleAction(action, element) {
     }
     case 'tt-play':
       ttToggle()
+      break
+    case 'cast-open':
+      castOpenSheet(element.dataset.kind || 'video')
       break
     case 'tt-mute':
       ttApplyVolume(ttAudio.volume > 0 ? 0 : ttLastVolume || 0.8)
@@ -8111,6 +8393,22 @@ function switchView(nextView) {
   document.getElementById('playerBack').addEventListener('click', closePlayer)
   playerNextEl.addEventListener('click', playNext)
   document.getElementById('playerFullscreen').addEventListener('click', toggleFullscreen)
+  const playerCastBtn = document.getElementById('playerCast')
+  if (playerCastBtn) {
+    if (!castSupported()) playerCastBtn.classList.add('hidden')
+    else playerCastBtn.addEventListener('click', () => castOpenSheet('video'))
+  }
+  const castSheetEl = document.getElementById('castSheet')
+  if (castSheetEl) {
+    castSheetEl.addEventListener('click', (event) => {
+      if (event.target === castSheetEl || event.target.closest('#castClose')) {
+        castCloseSheet()
+        return
+      }
+      const actionEl = event.target.closest('[data-action]')
+      if (actionEl) handleCastAction(actionEl.dataset.action, actionEl)
+    })
+  }
   document.getElementById('playerExternal').addEventListener('click', () => {
     if (player.current?.file) bridge.openPath(player.current.file)
   })

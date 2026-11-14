@@ -12,5 +12,6 @@ class AppViewController: CAPBridgeViewController {
         bridge?.registerPluginInstance(GyDevicePlugin())
         bridge?.registerPluginInstance(GyHttpPlugin())
         bridge?.registerPluginInstance(GyImmersivePlugin())
+        bridge?.registerPluginInstance(GyDlnaPlugin())
     }
 }

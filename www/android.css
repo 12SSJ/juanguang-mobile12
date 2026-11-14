@@ -1741,3 +1741,213 @@ html[data-gy-size='xs'] .hero-poster {
   visibility: hidden !important;
   pointer-events: none !important;
 }
+
+/* ---------- DLNA 投屏面板 ---------- */
+.cast-sheet {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2147483000;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(4, 5, 9, 0.66);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 16px;
+}
+
+.cast-sheet.hidden {
+  display: none !important;
+}
+
+/* 投屏面板打开时隐藏视频画面，否则安卓 WebView 的视频层会盖在面板上方 */
+body.cast-open #player video {
+  visibility: hidden;
+}
+
+.cast-panel {
+  width: min(420px, 100%);
+  max-height: 78vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  border: 1px solid rgba(233, 185, 91, 0.28);
+  background: linear-gradient(180deg, rgba(28, 30, 38, 0.98), rgba(14, 15, 20, 0.99));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.cast-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  color: #f4e6c6;
+  font-size: 15px;
+}
+
+.cast-head strong {
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.cast-x {
+  border: 0;
+  background: transparent;
+  color: rgba(244, 230, 198, 0.7);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.cast-body {
+  padding: 4px 16px 16px;
+  overflow-y: auto;
+  color: #e8e4da;
+  font-size: 14px;
+}
+
+.cast-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 26px 8px;
+  color: rgba(232, 228, 218, 0.72);
+  text-align: center;
+  line-height: 1.6;
+}
+
+.cast-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cast-device {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #eee7d7;
+  font-size: 15px;
+  text-align: left;
+}
+
+.cast-device:active {
+  background: rgba(233, 185, 91, 0.16);
+  border-color: rgba(233, 185, 91, 0.45);
+}
+
+.cast-device-icon {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: rgba(233, 185, 91, 0.16);
+  color: #e9b95b;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.cast-device-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cast-foot {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
+}
+
+.cast-now {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(233, 185, 91, 0.1);
+  border: 1px solid rgba(233, 185, 91, 0.24);
+}
+
+.cast-now-mark {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(233, 185, 91, 0.22);
+  color: #f0c974;
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+
+.cast-now-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #fdf6e6;
+  word-break: break-all;
+}
+
+.cast-now-device {
+  font-size: 12px;
+  color: rgba(232, 228, 218, 0.62);
+}
+
+.cast-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cast-actions .cast-btn {
+  flex: 1 1 0;
+}
+
+.cast-btn {
+  padding: 10px 16px;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: #efe8d8;
+  font-size: 14px;
+}
+
+.cast-btn.primary {
+  border-color: rgba(233, 185, 91, 0.5);
+  background: linear-gradient(180deg, rgba(233, 185, 91, 0.28), rgba(233, 185, 91, 0.14));
+  color: #ffeec2;
+}
+
+.cast-btn.ghost {
+  color: rgba(232, 228, 218, 0.78);
+}
+
+.cast-tip {
+  margin-top: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: rgba(232, 228, 218, 0.5);
+}
+
+#playerCast.is-casting {
+  color: #e9b95b;
+  filter: drop-shadow(0 0 8px rgba(233, 185, 91, 0.6));
+}
+
+.tt-cast-btn {
+  color: #e9b95b !important;
+}

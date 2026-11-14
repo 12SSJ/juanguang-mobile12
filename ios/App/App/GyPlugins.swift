@@ -231,3 +231,471 @@ public class GyImmersivePlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve()
     }
 }
+
+/* ---------------- DLNA 投屏 ----------------
+   SSDP 组播搜索 MediaRenderer 设备，再用 SOAP 调 AVTransport 把播放地址推给电视。
+   iOS 14 起收发组播需要系统授权（首次会弹出「查找并连接本地网络设备」）。 */
+
+@objc(GyDlnaPlugin)
+public class GyDlnaPlugin: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "GyDlnaPlugin"
+    public let jsName = "GyDlna"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "discover", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cast", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pause", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "resume", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "seek", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setVolume", returnType: CAPPluginReturnPromise)
+    ]
+
+    private let ssdpHost = "239.255.255.250"
+    private let ssdpPort: UInt16 = 1900
+    private let avt = "urn:schemas-upnp-org:service:AVTransport:1"
+    private let rcs = "urn:schemas-upnp-org:service:RenderingControl:1"
+
+    private var controlUrl = ""
+    private var volumeUrl = ""
+    private var deviceName = ""
+
+    @objc func discover(_ call: CAPPluginCall) {
+        let timeout = min(6000, max(1200, call.getInt("timeout") ?? 2600))
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.ssdpLocations(timeoutMs: timeout)
+            var devices: [[String: Any]] = []
+            var seen = Set<String>()
+            for location in result.locations.prefix(12) {
+                guard let info = self.deviceInfo(location: location) else { continue }
+                if seen.contains(info.control) { continue }
+                seen.insert(info.control)
+                devices.append([
+                    "id": info.control,
+                    "name": info.name,
+                    "location": location,
+                    "controlUrl": info.control,
+                    "volumeUrl": info.volume
+                ])
+            }
+            var hint = ""
+            if devices.isEmpty {
+                if self.localSubnetPrefix() == nil {
+                    hint = "no-wifi"
+                } else if result.multicastFailed {
+                    hint = "ios-local-network"
+                }
+            }
+            call.resolve(["devices": devices, "hint": hint])
+        }
+    }
+
+    @objc func cast(_ call: CAPPluginCall) {
+        let url = call.getString("url") ?? ""
+        let title = call.getString("title") ?? ""
+        let type = call.getString("type") ?? "video"
+        let seconds = call.getDouble("seconds") ?? 0
+        let tuneVolume = call.getBool("tuneVolume") ?? false
+        let device = call.getObject("device") ?? [:]
+        guard url.hasPrefix("http") else {
+            call.reject("播放地址不可投屏")
+            return
+        }
+        let control = (device["controlUrl"] as? String) ?? ""
+        guard !control.isEmpty else {
+            call.reject("设备不支持投屏控制")
+            return
+        }
+        let volume = (device["volumeUrl"] as? String) ?? ""
+        let name = (device["name"] as? String) ?? ""
+        controlUrl = control
+        volumeUrl = volume
+        deviceName = name
+        DispatchQueue.global(qos: .userInitiated).async {
+            let audio = type == "music"
+            let mime = audio ? self.audioMime(url) : self.videoMime(url)
+            let metadata = self.metadata(url: url, title: title, audio: audio, mime: mime)
+            let body = "<InstanceID>0</InstanceID>"
+                + "<CurrentURI>\(self.escape(url))</CurrentURI>"
+                + "<CurrentURIMetaData>\(self.escape(metadata))</CurrentURIMetaData>"
+            guard self.soap(control, service: self.avt, action: "SetAVTransportURI", body: body) else {
+                call.reject("电视拒绝了该播放地址")
+                return
+            }
+            _ = self.soap(control, service: self.avt, action: "Play",
+                          body: "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            if seconds > 3 {
+                _ = self.soap(control, service: self.avt, action: "Seek", body: self.seekBody(seconds))
+            }
+            if tuneVolume && !volume.isEmpty {
+                _ = self.soap(volume, service: self.rcs, action: "SetVolume",
+                              body: "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>60</DesiredVolume>")
+            }
+            call.resolve(["ok": true, "device": name])
+        }
+    }
+
+    @objc func pause(_ call: CAPPluginCall) {
+        transport(call, action: "Pause", body: "<InstanceID>0</InstanceID>")
+    }
+
+    @objc func resume(_ call: CAPPluginCall) {
+        transport(call, action: "Play", body: "<InstanceID>0</InstanceID><Speed>1</Speed>")
+    }
+
+    @objc func stop(_ call: CAPPluginCall) {
+        transport(call, action: "Stop", body: "<InstanceID>0</InstanceID>")
+    }
+
+    @objc func seek(_ call: CAPPluginCall) {
+        let seconds = call.getDouble("seconds") ?? 0
+        transport(call, action: "Seek", body: seekBody(seconds))
+    }
+
+    @objc func setVolume(_ call: CAPPluginCall) {
+        let level = min(100, max(0, call.getInt("volume") ?? 50))
+        let url = volumeUrl
+        guard !url.isEmpty else {
+            call.reject("设备不支持音量控制")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = self.soap(url, service: self.rcs, action: "SetVolume",
+                               body: "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>\(level)</DesiredVolume>")
+            call.resolve(["ok": ok])
+        }
+    }
+
+    /* ---------------- 控制 ---------------- */
+
+    private func transport(_ call: CAPPluginCall, action: String, body: String) {
+        let url = controlUrl
+        guard !url.isEmpty else {
+            call.reject("还没有连接投屏设备")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = self.soap(url, service: self.avt, action: action, body: body)
+            call.resolve(["ok": ok])
+        }
+    }
+
+    private func seekBody(_ seconds: Double) -> String {
+        let total = Int(max(0, seconds))
+        let target = String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        return "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>\(target)</Target>"
+    }
+
+    private func videoMime(_ url: String) -> String {
+        let lower = url.lowercased()
+        if lower.contains(".m3u8") { return "application/vnd.apple.mpegurl" }
+        if lower.contains(".webm") { return "video/webm" }
+        if lower.contains(".mkv") { return "video/x-matroska" }
+        return "video/mp4"
+    }
+
+    private func audioMime(_ url: String) -> String {
+        let lower = url.lowercased()
+        if lower.contains(".flac") { return "audio/flac" }
+        if lower.contains(".aac") || lower.contains(".m4a") { return "audio/mp4" }
+        return "audio/mpeg"
+    }
+
+    private func metadata(url: String, title: String, audio: Bool, mime: String) -> String {
+        let cls = audio ? "object.item.audioItem.musicTrack" : "object.item.videoItem"
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
+            + " xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
+            + " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
+            + "<item id=\"0\" parentID=\"-1\" restricted=\"1\">"
+            + "<dc:title>\(escape(name.isEmpty ? "娟光阅影" : name))</dc:title>"
+            + "<upnp:class>\(cls)</upnp:class>"
+            + "<res protocolInfo=\"http-get:*:\(mime):*\">\(escape(url))</res>"
+            + "</item></DIDL-Lite>"
+    }
+
+    private func soap(_ url: String, service: String, action: String, body: String) -> Bool {
+        guard let target = URL(string: url) else { return false }
+        let envelope = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\""
+            + " s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+            + "<s:Body><u:\(action) xmlns:u=\"\(service)\">\(body)</u:\(action)></s:Body></s:Envelope>"
+        var request = URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 6)
+        request.httpMethod = "POST"
+        request.httpBody = Data(envelope.utf8)
+        request.setValue("text/xml; charset=\"utf-8\"", forHTTPHeaderField: "Content-Type")
+        request.setValue("\"\(service)#\(action)\"", forHTTPHeaderField: "SOAPACTION")
+        let semaphore = DispatchSemaphore(value: 0)
+        var success = false
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if error == nil, let http = response as? HTTPURLResponse {
+                success = http.statusCode >= 200 && http.statusCode < 300
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 8)
+        return success
+    }
+
+    /* ---------------- SSDP ---------------- */
+
+    /* iOS 对组播收发有系统限制：没有组播权限时 sendto 会直接失败，
+       所以组播搜不到设备时，再逐个向局域网内 IP 发单播 M-SEARCH 兜底。 */
+
+    private func ssdpLocations(timeoutMs: Int) -> (locations: [String], multicastFailed: Bool) {
+        let multicast = multicastSearch(timeoutMs: timeoutMs)
+        var locations = multicast.locations
+        if locations.isEmpty, let prefix = localSubnetPrefix() {
+            locations.append(contentsOf: unicastSearch(prefix: prefix, timeoutMs: max(1600, timeoutMs)))
+        }
+        return (locations, multicast.failed)
+    }
+
+    private func localSubnetPrefix() -> String? {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0 else { return nil }
+        defer { freeifaddrs(addrs) }
+        var fallback: String?
+        var cursor = addrs
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+            guard let addr = current.pointee.ifa_addr,
+                  addr.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            let ip = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { ptr -> String in
+                var value = ptr.pointee.sin_addr
+                return String(cString: inet_ntoa(value))
+            }
+            guard !ip.isEmpty, !ip.hasPrefix("127."), !ip.hasPrefix("169.254.") else { continue }
+            let parts = ip.split(separator: ".")
+            guard parts.count == 4 else { continue }
+            let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+            if String(cString: current.pointee.ifa_name) == "en0" { return prefix }
+            if fallback == nil { fallback = prefix }
+        }
+        return fallback
+    }
+
+    private func unicastSearch(prefix: String, timeoutMs: Int) -> [String] {
+        var locations: [String] = []
+        var seen = Set<String>()
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return locations }
+        defer { close(fd) }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 0, tv_usec: 400_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var local = sockaddr_in()
+        local.sin_family = sa_family_t(AF_INET)
+        local.sin_port = in_port_t(0).bigEndian
+        local.sin_addr.s_addr = INADDR_ANY
+        let bound = withUnsafePointer(to: &local) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { return locations }
+
+        let payload = Array(searchMessage.utf8)
+        for round in 0..<2 {
+            for host in 1...254 {
+                var target = sockaddr_in()
+                target.sin_family = sa_family_t(AF_INET)
+                target.sin_port = ssdpPort.bigEndian
+                target.sin_addr.s_addr = inet_addr("\(prefix).\(host)")
+                _ = payload.withUnsafeBytes { raw in
+                    withUnsafePointer(to: &target) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, raw.baseAddress, payload.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+            }
+            if round == 0 { Thread.sleep(forTimeInterval: 0.25) }
+        }
+
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while Date() < deadline {
+            var from = sockaddr()
+            var fromLength = socklen_t(MemoryLayout<sockaddr>.size)
+            let received = buffer.withUnsafeMutableBytes { raw -> Int in
+                withUnsafeMutablePointer(to: &from) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &fromLength)
+                    }
+                }
+            }
+            if received <= 0 { continue }
+            let text = String(decoding: buffer[0..<received], as: UTF8.self)
+            if let location = headerValue(text, "location"), !seen.contains(location) {
+                seen.insert(location)
+                locations.append(location)
+            }
+        }
+        return locations
+    }
+
+    private var searchMessage: String {
+        "M-SEARCH * HTTP/1.1\r\n"
+            + "HOST: \(ssdpHost):\(ssdpPort)\r\n"
+            + "MAN: \"ssdp:discover\"\r\n"
+            + "MX: 2\r\n"
+            + "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+    }
+
+    private func multicastSearch(timeoutMs: Int) -> (locations: [String], failed: Bool) {
+        var locations: [String] = []
+        var seen = Set<String>()
+        var failed = false
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return (locations, true) }
+        defer { close(fd) }
+
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 0, tv_usec: 500_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var local = sockaddr_in()
+        local.sin_family = sa_family_t(AF_INET)
+        local.sin_port = in_port_t(0).bigEndian
+        local.sin_addr.s_addr = INADDR_ANY
+        let bound = withUnsafePointer(to: &local) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { return (locations, false) }
+
+        let payload = Array(searchMessage.utf8)
+        var target = sockaddr_in()
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_port = ssdpPort.bigEndian
+        target.sin_addr.s_addr = inet_addr(ssdpHost)
+
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        var nextSend = Date()
+        var sent = 0
+        var buffer = [UInt8](repeating: 0, count: 4096)
+
+        while Date() < deadline {
+            if Date() >= nextSend && sent < 3 {
+                let wrote = payload.withUnsafeBytes { raw -> Int in
+                    withUnsafePointer(to: &target) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, raw.baseAddress, payload.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                sent += 1
+                nextSend = Date().addingTimeInterval(0.4)
+                // 组播被系统拦截，不必再等，直接交给单播兜底
+                if wrote < 0 {
+                    failed = true
+                    break
+                }
+            }
+            var from = sockaddr()
+            var fromLength = socklen_t(MemoryLayout<sockaddr>.size)
+            let received = buffer.withUnsafeMutableBytes { raw -> Int in
+                withUnsafeMutablePointer(to: &from) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &fromLength)
+                    }
+                }
+            }
+            if received <= 0 { continue }
+            let text = String(decoding: buffer[0..<received], as: UTF8.self)
+            if let location = headerValue(text, "location"), !seen.contains(location) {
+                seen.insert(location)
+                locations.append(location)
+            }
+        }
+        return (locations, failed)
+    }
+
+    private func headerValue(_ text: String, _ name: String) -> String? {
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces).lowercased() == name {
+                return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    private func deviceInfo(location: String) -> (name: String, control: String, volume: String)? {
+        guard let url = URL(string: location), let xml = fetchText(url) else { return nil }
+        let name = decodeEntities(firstMatch("<friendlyName[^>]*>(.*?)</friendlyName>", in: xml) ?? "")
+        if name.isEmpty { return nil }
+        var control = ""
+        var volume = ""
+        guard let blockRegex = try? NSRegularExpression(pattern: "<service>(.*?)</service>",
+                                                        options: [.dotMatchesLineSeparators]) else { return nil }
+        let range = NSRange(xml.startIndex..<xml.endIndex, in: xml)
+        for match in blockRegex.matches(in: xml, options: [], range: range) {
+            guard let blockRange = Range(match.range(at: 1), in: xml) else { continue }
+            let block = String(xml[blockRange])
+            guard let type = firstMatch("<serviceType[^>]*>(.*?)</serviceType>", in: block),
+                  let raw = firstMatch("<controlURL[^>]*>(.*?)</controlURL>", in: block) else { continue }
+            let absolute = resolve(base: location, relative: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            if type.contains(":AVTransport:") {
+                control = absolute
+            } else if type.contains(":RenderingControl:") {
+                volume = absolute
+            }
+        }
+        guard !control.isEmpty else { return nil }
+        return (name, control, volume)
+    }
+
+    private func fetchText(_ url: URL) -> String? {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        let semaphore = DispatchSemaphore(value: 0)
+        var data: Data?
+        URLSession.shared.dataTask(with: request) { body, _, _ in
+            data = body
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 6)
+        guard let body = data else { return nil }
+        return String(data: body, encoding: .utf8) ?? String(data: body, encoding: .isoLatin1)
+    }
+
+    private func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[valueRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func resolve(base: String, relative: String) -> String {
+        if relative.hasPrefix("http://") || relative.hasPrefix("https://") { return relative }
+        guard let baseUrl = URL(string: base), let resolved = URL(string: relative, relativeTo: baseUrl) else {
+            return relative
+        }
+        return resolved.absoluteString
+    }
+
+    private func escape(_ text: String) -> String {
+        return text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+
+    private func decodeEntities(_ text: String) -> String {
+        return text
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
+    }
+}
