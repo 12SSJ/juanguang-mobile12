@@ -4441,6 +4441,8 @@ async function ttLoadChart() {
     tt.index = 0
     tt.currentId = ''
     if (state.view === 'music') render()
+    // 先把前两首的直链解析好，进入音乐厅第一次点播放直接出声音
+    ttPrefetchSongs(tt.songs.slice(0, 2))
     return
   }
   tt.query = ''
@@ -4455,6 +4457,7 @@ async function ttLoadChart() {
     tt.loaded = true
     tt.loading = false
     if (state.view === 'music') render()
+    ttPrefetchSongs(tt.songs.slice(0, 2))
   } else {
     tt.loading = true
     if (state.view === 'music') render()
@@ -4477,6 +4480,7 @@ async function ttLoadChart() {
       tt.index = 0
       if (state.view === 'music') render()
     }
+    ttPrefetchSongs(tt.songs.slice(0, 2))
   } else if (!fromCache) {
     // 加载失败自动重试（最多 3 次），期间保持加载态，用户不用手动点「重新加载」
     tt.loadRetry = (tt.loadRetry || 0) + 1
@@ -4673,6 +4677,8 @@ async function ttSearch(keyword) {
   }
   ttToolsSearchEnd()
   if (state.view === 'music') render()
+  // 搜索结果前两首也提前解析直链，点播放即出声音
+  ttPrefetchSongs(tt.songs.slice(0, 2))
 }
 
 function ensureTtLoaded() {
@@ -4683,6 +4689,7 @@ function ensureTtLoaded() {
       tt.loaded = true
       tt.index = 0
       tt.currentId = ''
+      ttPrefetchSongs(tt.songs.slice(0, 2))
     } else {
       ttLoadChart()
     }
@@ -4732,6 +4739,7 @@ async function ttLoadToplist(id, name) {
     tt.loaded = true
     tt.loading = false
     if (state.view === 'music') render()
+    ttPrefetchSongs(tt.songs.slice(0, 2))
   } else {
     tt.loading = true
     tt.loaded = false
@@ -4754,7 +4762,10 @@ async function ttLoadToplist(id, name) {
   }
   tt.loading = false
   if (state.view === 'music') render()
-  if (tt.songs.length) toast(`已载入「${name || '热门歌单'}」${tt.songs.length} 首`)
+  if (tt.songs.length) {
+    ttPrefetchSongs(tt.songs.slice(0, 2))
+    toast(`已载入「${name || '热门歌单'}」${tt.songs.length} 首`)
+  }
 }
 
 function formatPlayCount(n) {
@@ -4788,6 +4799,15 @@ function ttEnsureAudio() {
   ttAudio.addEventListener('pause', ttSyncUi)
   ttAudio.addEventListener('playing', () => {
     ttSlot().failStreak = 0
+    // 起播后顺手把后面两首的直链解析好，切歌时不用再等
+    const list = ttActiveList()
+    const index = ttSlot().index
+    ttPrefetchSongs(
+      list
+        .slice(index + 1, index + 3)
+        .map((track) => track.song)
+        .filter(Boolean)
+    )
   })
   ttAudio.addEventListener('loadedmetadata', () => {
     const tt = ttSlot()
@@ -4901,6 +4921,22 @@ function ttPlay(index) {
     ttFallbackNetease(track)
     return
   }
+  // 预取到的直链过期就丢掉，避免点播放先报一次失败
+  if (track.url && track.song && track.song.urlAt && Date.now() - track.song.urlAt > TT_URL_TTL) {
+    track.url = ''
+    track.song.url = ''
+    track.song.urlAt = 0
+  }
+  // 直链正在后台预取：直接等这一次结果，避免点播放时再重复查一遍
+  if (!track.url && track.song && track.song.prefetchPromise) {
+    const token = tt.playToken
+    track.song.prefetchPromise.then((url) => {
+      if (tt.playToken !== token) return
+      if (url) track.url = url
+      ttPlay(target)
+    })
+    return
+  }
   if (!track.url && track.migu) {
     ttResolveMigu(track)
     return
@@ -4921,6 +4957,94 @@ function ttPlay(index) {
   ttAudio.play().catch(() => toast('音频播放失败，请稍后重试'))
   ensureTtLyric()
   if (state.view === 'music') render()
+}
+
+/* ---------- 播放地址预取 ----------
+   点播放要等几秒，是因为直链要现查。这里在后台把歌单前几首的直链先解析好写回 song.url，
+   点播放时直接用现成地址出声音；解析失败不打扰用户，点播放时仍走正常兜底链。 */
+const ttPrefetchQueue = []
+let ttPrefetchBusy = false
+// 预取到的直链有效期，过期就重新解析，避免点了播放先失败一次
+const TT_URL_TTL = 5 * 60 * 1000
+
+function ttPrefetchSongs(songs) {
+  for (const song of songs || []) {
+    if (!song || song.url || song.prefetching || !song.id) continue
+    if (ttPrefetchQueue.includes(song)) continue
+    ttPrefetchQueue.push(song)
+  }
+  ttPrefetchNext()
+}
+
+function ttPrefetchNext() {
+  if (ttPrefetchBusy) return
+  const song = ttPrefetchQueue.shift()
+  if (!song) return
+  if (song.url) {
+    ttPrefetchNext()
+    return
+  }
+  ttPrefetchBusy = true
+  song.prefetching = true
+  const job = ttResolveUrlQuiet(song)
+    .catch(() => '')
+    .then((url) => {
+      if (url) {
+        song.url = url
+        song.urlAt = Date.now()
+      }
+      song.prefetching = false
+      song.prefetchPromise = null
+      ttPrefetchBusy = false
+      ttPrefetchNext()
+      return url
+    })
+  // 点播放时直接等这一次在途的解析结果
+  song.prefetchPromise = job
+}
+
+async function ttResolveUrlQuiet(song) {
+  const vendor = String(song.vendor || '')
+  const id = String(song.id || '')
+  const title = String(song.title || '')
+  const artist = String(song.artist || '')
+  try {
+    if (vendor === 'netease' && id) {
+      const res = await bridge.gdUrl({ id })
+      return res && res.url ? String(res.url) : ''
+    }
+    if (vendor === 'tencent' && id) {
+      // QQ 版权曲大多只给试听：和歌曲宝并行查，QQ 能给出完整版时仍优先用 QQ
+      const gqbJob = (async () => {
+        const found = await bridge.gqbSearch({ keyword: `${title} ${artist}`.trim(), limit: 20 })
+        const ranked = ttRankCandidates((found && found.list) || [], { title, artist, duration: song.duration }, 3)
+        for (const cand of ranked) {
+          const one = await bridge.gqbUrl({ id: cand.id })
+          if (one && one.url) return String(one.url)
+        }
+        return ''
+      })().catch(() => '')
+      const res = await bridge.qqUrl({ mid: id })
+      if (res && res.url) {
+        const real = Number(res.duration) || 0
+        const expect = Number(song.duration) || 0
+        // 明显短于原曲的是版权试听片段，不缓存，播放时再走完整兜底链
+        if (!real || !expect || real >= expect * 0.6) return String(res.url)
+      }
+      return await gqbJob
+    }
+    if (vendor === 'migu' && id) {
+      const res = await bridge.miguUrl({
+        contentId: id,
+        copyrightId: song.copyrightId || '',
+        resourceType: song.resourceType || '2'
+      })
+      return res && res.url ? String(res.url) : ''
+    }
+  } catch (err) {
+    /* 预取失败不打扰用户 */
+  }
+  return ''
 }
 
 async function ttResolveMigu(track) {
@@ -7934,6 +8058,8 @@ async function handleAction(action, element) {
       tt.renaming = ''
       if (tt.panel === 'top') ttLoadToplists()
       if (state.view === 'music') render()
+      // 换到「我喜欢 / 我的歌单」时，前两首直链也提前备好
+      ttPrefetchSongs(ttActiveList().slice(0, 2).map((track) => track.song).filter(Boolean))
       break
     }
     case 'tt-top-list': {
@@ -7987,6 +8113,7 @@ async function handleAction(action, element) {
       tt.searchMode = false
       tt.renaming = ''
       if (state.view === 'music') render()
+      ttPrefetchSongs(ttActiveList().slice(0, 2).map((track) => track.song).filter(Boolean))
       break
     }
     case 'tt-back-pl': {
@@ -8203,6 +8330,15 @@ function switchView(nextView) {
     ttVoicePrepare()
     // 每次从别的页面进音乐厅都把音量拉回 40%，不再以最大声开播
     if (state.view !== 'music') ttApplyVolume(TT_DEFAULT_VOLUME)
+    // 进音乐厅就先把内置歌单前两首的直链备好，点播放即出声音
+    try {
+      const tt = ttSlot()
+      window.setTimeout(() => {
+        ttPrefetchSongs((tt.songs.length ? tt.songs : TT_DEFAULT_SONGS).slice(0, 2))
+      }, 120)
+    } catch {
+      /* 预取失败不影响主流程 */
+    }
   }
   if (nextView === 'drama') {
     const dramaSlot = categorySlot('drama')
@@ -8722,6 +8858,17 @@ async function init() {
       /* 预取失败不影响主流程 */
     }
   }, 300)
+  // 音频元素事件提前绑定，避免第一次点播放时才初始化
+  ttEnsureAudio()
+  // 内置歌单前两首的直链提前解析好，第一次点播放直接出声音
+  window.setTimeout(() => {
+    try {
+      const tt = ttSlot()
+      ttPrefetchSongs((tt.songs.length ? tt.songs : TT_DEFAULT_SONGS).slice(0, 2))
+    } catch {
+      /* 预取失败不影响主流程 */
+    }
+  }, 200)
   // 电台频道也在后台拉好，切过去不用等
   window.setTimeout(() => {
     try {
