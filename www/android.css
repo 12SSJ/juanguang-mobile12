@@ -567,6 +567,22 @@ body {
   gap: 10px;
 }
 
+/* iOS 版与 APK 版统一音乐厅布局：去掉音量条（喇叭 + 滑块 + 百分比），
+   控制按钮行只保留上一首/播放/下一首/投屏与播放模式 */
+.tt-volume {
+  display: none !important;
+}
+
+/* 去掉「晴晴音阁」标题左边的 ♪ 圆标 */
+.tt-mark {
+  display: none !important;
+}
+
+/* 晴晴音阁标题栏下面那条黑线去掉 */
+.tt-bar {
+  border-bottom: 0 !important;
+}
+
 .tt-vol-btn {
   flex: none;
   display: grid;
