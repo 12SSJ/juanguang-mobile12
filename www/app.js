@@ -4794,7 +4794,9 @@ function ttEnsureAudio() {
     const track = ttActiveList()[tt.index]
     if (!track || track.shortChecked) return
     const real = Number(ttAudio.duration) || 0
-    const expected = Number((track.song && track.song.duration) || track.duration || 0)
+    const expectedMs = Number((track.song && track.song.duration) || track.duration || 0)
+    // 曲目时长按毫秒记录，audio.duration 是秒，统一换算成秒再比较
+    const expected = expectedMs > 1000 ? expectedMs / 1000 : expectedMs
     if (!real || !expected) return
     // 版权歌曲常只给 30 秒试听：时长明显偏短就换源
     if (real < 90 && expected >= 150) {
@@ -5048,7 +5050,7 @@ async function ttResolveTencent(track) {
 }
 
 /* 版本标记：DJ/Remix/伴奏/翻唱/现场等。原曲名本身带这些词时不拦截 */
-const TT_BAD_VERSION = /(\bdj\b|dj版|remix|rework|bootleg|mashup|混音|慢摇|抖音|铃声|伴奏|instrumental|\binst\b|karaoke|纯音乐|钢琴版|吉他版|八音盒|翻唱|\bcover\b|翻自|现场|\blive\b|演唱会|音乐节|acoustic|不插电|\bdemo\b|试听|片段|剪辑|加快|降速|女声版|男声版|\bclub\b|\bdub\b|\bradio\b|extended|\bmix\b|\bedit\b|version|版)/i
+const TT_BAD_VERSION = /(\bdj\b|dj版|remix|rework|bootleg|mashup|混音|慢摇|抖音|铃声|伴奏|instrumental|\binst\b|karaoke|纯音乐|钢琴版|吉他版|八音盒|翻唱|\bcover\b|翻自|现场|\blive\b|演唱会|音乐节|acoustic|不插电|\bdemo\b|试听|片段|剪辑|加快|降速|女声版|男声版|\bclub\b|\bdub\b|\bradio\b|extended|\bmix\b|\bedit\b|version|acapella|a cappella|pella|beats|ultimix|tribute|mixshow|舞曲|电音|车载|串烧|消音|版)/i
 
 /* 候选是不是「另一个版本」：原曲名没带版本词，候选名带了就判为不同版本 */
 function ttVersionBad(title, baseTitle) {
