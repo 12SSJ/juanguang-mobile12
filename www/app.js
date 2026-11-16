@@ -4795,23 +4795,31 @@ function ttEnsureAudio() {
     if (!track || track.shortChecked) return
     const real = Number(ttAudio.duration) || 0
     const expected = Number((track.song && track.song.duration) || track.duration || 0)
+    if (!real || !expected) return
     // 版权歌曲常只给 30 秒试听：时长明显偏短就换源
-    if (!real || real >= 90 || expected < 150) return
-    track.shortChecked = true
-    toast(`「${track.title}」只有 ${Math.round(real)} 秒试听，正在切换其他音源…`)
-    if (track.source === '网易云' && !track.miguTried) {
-      track.miguTried = true
-      ttFallbackMigu(track)
+    if (real < 90 && expected >= 150) {
+      track.shortChecked = true
+      toast(`「${track.title}」只有 ${Math.round(real)} 秒试听，正在切换其他音源…`)
+      if (track.source === '网易云' && !track.miguTried) {
+        track.miguTried = true
+        ttFallbackMigu(track)
+        return
+      }
+      if (track.source === '咪咕音乐' && !track.tencentTried) {
+        track.tencentTried = true
+        ttFallbackTencent(track)
+        return
+      }
+      if (track.source === 'QQ音乐' && !track.gqbTried) {
+        track.gqbTried = true
+        ttFallbackGqb(track)
+      }
       return
     }
-    if (track.source === '咪咕音乐' && !track.tencentTried) {
-      track.tencentTried = true
-      ttFallbackTencent(track)
-      return
-    }
-    if (track.source === 'QQ音乐' && !track.gqbTried) {
-      track.gqbTried = true
-      ttFallbackGqb(track)
+    // 播到的版本时长明显对不上（DJ版/现场版/翻唱）：不是用户点的那一版，继续换源
+    if (!track.versionAllowed && Math.abs(real - expected) > Math.max(45, expected * 0.22)) {
+      track.shortChecked = true
+      ttVersionMismatch(track)
     }
   })
   ttAudio.addEventListener('error', () => {
@@ -5039,8 +5047,54 @@ async function ttResolveTencent(track) {
   await ttFallbackGqb(track)
 }
 
+/* 版本标记：DJ/Remix/伴奏/翻唱/现场等。原曲名本身带这些词时不拦截 */
+const TT_BAD_VERSION = /(\bdj\b|dj版|remix|rework|bootleg|mashup|混音|慢摇|抖音|铃声|伴奏|instrumental|\binst\b|karaoke|纯音乐|钢琴版|吉他版|八音盒|翻唱|\bcover\b|翻自|现场|\blive\b|演唱会|音乐节|acoustic|不插电|\bdemo\b|试听|片段|剪辑|加快|降速|女声版|男声版|\bclub\b|\bdub\b|\bradio\b|extended|\bmix\b|\bedit\b|version|版)/i
+
+/* 候选是不是「另一个版本」：原曲名没带版本词，候选名带了就判为不同版本 */
+function ttVersionBad(title, baseTitle) {
+  const name = String(title || '')
+  const base = String(baseTitle || '')
+  if (!base) return false
+  // 原曲名自己就带版本标记（用户要的就是现场版/DJ版）时不拦截
+  if (TT_BAD_VERSION.test(base)) return false
+  return TT_BAD_VERSION.test(name)
+}
+
+/* 换源后实际时长差太多：说明拿到的不是用户要的那一版，继续往下一个音源找 */
+function ttVersionMismatch(track) {
+  const tt = ttSlot()
+  const token = tt.playToken
+  const title = String(track.title || '')
+  track.url = ''
+  if (track.song) {
+    track.song.url = ''
+    track.song.urlAt = 0
+  }
+  toast(`「${title}」找到的版本时长不符，正在换源…`)
+  if (track.source === '网易云' && !track.miguTried) {
+    track.miguTried = true
+    ttFallbackMigu(track)
+    return
+  }
+  if (track.source === '咪咕音乐' && !track.tencentTried) {
+    track.tencentTried = true
+    ttFallbackTencent(track)
+    return
+  }
+  if (track.source === 'QQ音乐' && !track.gqbTried) {
+    track.gqbTried = true
+    ttFallbackGqb(track)
+    return
+  }
+  toast(`「${title}」只找到其他版本，已跳过`)
+  setTimeout(() => {
+    if (tt.playToken !== token) return
+    ttStep(1)
+  }, 300)
+}
+
 /* 按歌名+歌手+时长给多源搜索结果打分，优先同名、同歌手、时长接近的版本 */
-function ttRankCandidates(list, track, limit) {
+function ttRankCandidates(list, track, limit, allowBad) {
   const norm = (text) =>
     String(text || '')
       .replace(/[（(\[【][^）)\]】]*[）)\]】]/g, '')
@@ -5054,7 +5108,8 @@ function ttRankCandidates(list, track, limit) {
     .map((name) => name.trim())
     .filter(Boolean)
   const target = Number((track.song && track.song.duration) || track.duration || 0)
-  const scored = []
+  const clean = []
+  const bad = []
   for (const item of list || []) {
     const rawName = String(item.title || '')
     const name = norm(rawName)
@@ -5077,12 +5132,19 @@ function ttRankCandidates(list, track, limit) {
       // 时长差太多基本是翻录/裁剪版本，避免顶掉原版
       if (diff > 45000) score -= 60
     }
-    scored.push({ item, score })
+    const entry = { item, score }
+    if (ttVersionBad(rawName, titleRaw)) bad.push(entry)
+    else clean.push(entry)
   }
-  return scored
+  // 有原版就用原版；只有翻录版本时才在最后一层兜底里用（allowBad）
+  const pool = clean.length ? clean : allowBad ? bad : []
+  return pool
     .sort((a, b) => b.score - a.score)
     .slice(0, Math.max(1, Number(limit) || 4))
-    .map((entry) => entry.item)
+    .map((entry) => {
+      if (bad.includes(entry)) entry.item.badVersion = true
+      return entry.item
+    })
 }
 
 async function ttFallbackMigu(track) {
@@ -5190,7 +5252,7 @@ async function ttFallbackGqb(track) {
   }
   if (tt.playToken !== token) return
   const list = result && Array.isArray(result.list) ? result.list : []
-  const candidates = ttRankCandidates(list, track, 3)
+  const candidates = ttRankCandidates(list, track, 3, true)
   for (const cand of candidates) {
     let urlRes = null
     try {
@@ -5202,6 +5264,11 @@ async function ttFallbackGqb(track) {
     if (!urlRes || !urlRes.url) continue
     track.url = urlRes.url
     track.source = '歌曲宝'
+    // 兜底才拿到其他版本时，按实际版本播放并提示，不再让界面冒充原版
+    if (cand.badVersion) {
+      track.versionAllowed = true
+      toast(`「${track.title}」只找到「${cand.title}」，已按实际版本播放`)
+    }
     if (track.song) track.song.url = urlRes.url
     ttAudio.src = urlRes.url
     ttAudio.play().catch(() => toast('音频播放失败，请稍后重试'))
