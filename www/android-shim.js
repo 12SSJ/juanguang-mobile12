@@ -489,6 +489,8 @@ async function qqUrl({ mid }) {
         12000
       )
       const item = (data && data.data) || null
+      // 版权曲接口会直接标成「音乐试听」并只给 30 秒片段，降档也一样，不用再试下一档
+      if (item && /试听/.test(String(item.quality || ''))) break
       const url = item && item.url
       if (!url || !/^https?:\/\//i.test(url)) continue
       const seconds = vkeysDuration(item.interval) / 1000
@@ -500,6 +502,41 @@ async function qqUrl({ mid }) {
     } catch (_) {}
   }
   return { error: 'QQ 音乐暂无该曲完整版' }
+}
+
+/*
+ * QQ 音乐歌词：按 songmid 精确取该曲自己的歌词。
+ * 之前所有歌曲都拿网易云同名曲的歌词，网易云没有原版时就会抓到翻唱版，
+ * 歌词内容和时间轴都对不上（例如刘德华《今天》）。
+ */
+async function qqLyric({ mid }) {
+  const id = String(mid || '').trim()
+  if (!id) return { error: '缺少歌曲 ID' }
+  const decode = (text) =>
+    String(text || '')
+      .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+      .replace(/&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+  try {
+    const data = await nativeJson(
+      `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=${encodeURIComponent(
+        id
+      )}&format=json&nobase64=1&g_tk=5381`,
+      {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Referer: 'https://y.qq.com/'
+      },
+      10000
+    )
+    const lyric = decode(data && data.lyric)
+    if (!lyric) return { error: 'QQ 音乐暂无歌词' }
+    return { lyric, tlyric: decode(data && data.trans) }
+  } catch (err) {
+    return { error: String(err && err.message ? err.message : err) }
+  }
 }
 
 /* ---------- 网易云完整版（GD Studio 代理）：绕过 VIP 歌曲的 30 秒试听 ---------- */
@@ -729,6 +766,7 @@ window.api = {
   kugouUrl: stub({ url: '' }),
   qqSearch,
   qqUrl,
+  qqLyric,
   gdUrl,
   gqbSearch,
   gqbUrl,

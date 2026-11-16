@@ -3504,52 +3504,92 @@ async function ensureTtLyric() {
   lyric.loading = true
   if (state.view === 'music') render()
 
-  let neteaseId = song.vendor === 'netease' ? song.id : ''
-  // 非网易云歌曲：通过网易云搜索同名歌曲来获取歌词
-  if (!neteaseId) {
-    try {
-      const songName = song.title || song.name || ''
-      // 括号后缀（国语版/Live/快四版等）会让搜索命中别的歌，先去掉再搜
-      const baseName = songName.replace(/[（(\[【][^）)\]】]*[）)\]】]/g, '').trim() || songName
-      const artist = String(song.artist || '').split(/[/、,&]/)[0].trim()
-      const kw = `${baseName} ${artist}`.trim()
-      const search = await bridge.neteaseSearch({ keyword: kw, limit: 20 })
-      if (search && Array.isArray(search.list) && search.list.length) {
-        // 歌名相同优先，其次时长最接近，避免取到别的歌或版本差异过大的歌词
-        const wantMs = Number(song.duration) || 0
-        const norm = (value) => String(value || '').toLowerCase().replace(/[\s\-_·・()（）\[\]【】]/g, '')
-        const target = norm(baseName)
-        const nameOf = (item) => item.title || item.name || ''
-        let best = null
-        let bestScore = Infinity
-        let closest = null
-        let closestDiff = Infinity
-        search.list.forEach((item) => {
-          const itemMs = Number(item.duration) || 0
-          const diff = wantMs && itemMs ? Math.abs(itemMs - wantMs) : 0
-          const itemName = norm(nameOf(item))
-          const sameName = target && itemName && (itemName.indexOf(target) !== -1 || target.indexOf(itemName) !== -1)
-          if (sameName && diff < bestScore) {
-            bestScore = diff
-            best = item
-          }
-          if (diff < closestDiff) {
-            closestDiff = diff
-            closest = item
-          }
-        })
-        // 没有同名结果时，仅接受时长高度接近的候选，否则宁可不出歌词也不张冠李戴
-        neteaseId = best ? best.id : closestDiff <= 10000 && closest ? closest.id : ''
+  const songName = song.title || song.name || ''
+  // 括号后缀（国语版/Live/快四版等）会让搜索命中别的歌，先去掉再搜
+  const baseName = songName.replace(/[（(\[【][^）)\]】]*[）)\]】]/g, '').trim() || songName
+  const artists = String(song.artist || '')
+    .split(/[/、,&]/)
+    .map((name) => name.trim())
+    .filter((name) => name && !/^(未知歌手|未知|unknown)$/i.test(name))
+  const normText = (value) => String(value || '').toLowerCase().replace(/[\s\-_·・()（）\[\]【】]/g, '')
+  const normArtist = (value) => String(value || '').toLowerCase().replace(/\s+/g, '')
+  // 只接受同名且歌手对得上的候选：同名不同歌手基本都是翻唱，歌词时间轴会对不上
+  const artistHit = (item) => {
+    if (!artists.length) return true
+    const targets = artists.map(normArtist)
+    return String(item.artist || '')
+      .split(/[/、,&]/)
+      .map(normArtist)
+      .filter(Boolean)
+      .some((part) => targets.some((name) => part === name || part.includes(name) || name.includes(part)))
+  }
+  const pickBest = (list, wantMs) => {
+    const target = normText(baseName)
+    let best = null
+    let bestScore = Infinity
+    ;(list || []).forEach((item) => {
+      const itemName = normText(item.title || item.name || '')
+      if (!target || !itemName) return
+      const sameName =
+        itemName === target ||
+        (itemName.indexOf(target) !== -1 && itemName.length <= target.length + 6) ||
+        (target.indexOf(itemName) !== -1 && target.length <= itemName.length + 6)
+      if (!sameName || !artistHit(item)) return
+      const itemMs = Number(item.duration) || 0
+      // 时长差超过 15 秒基本是翻唱/现场版，宁可不显示歌词也不张冠李戴
+      const diff = wantMs && itemMs ? Math.abs(itemMs - wantMs) : 0
+      if (wantMs && itemMs && diff > 15000) return
+      const score = wantMs && itemMs ? diff : 15000
+      if (score < bestScore) {
+        bestScore = score
+        best = item
       }
+    })
+    return best
+  }
+  const wantMs = Number(song.duration) || 0
+
+  let result = null
+  // QQ 曲目按 songmid 直接取原版歌词，网易云没有原版时不会再抓到翻唱版
+  if (song.vendor === 'tencent' && song.id) {
+    try {
+      result = await bridge.qqLyric({ mid: song.id })
+    } catch {
+      result = null
+    }
+    if (result && !result.lyric) result = null
+    if (lyric.key !== key) return
+  }
+  let neteaseId = song.vendor === 'netease' ? String(song.id || '') : ''
+  if (!result && !neteaseId) {
+    try {
+      const search = await bridge.neteaseSearch({
+        keyword: `${baseName} ${artists[0] || ''}`.trim(),
+        limit: 20
+      })
+      const best = pickBest((search && search.list) || [], wantMs)
+      neteaseId = best ? String(best.id) : ''
     } catch {
       neteaseId = ''
     }
   }
 
-  let result = null
-  if (neteaseId) {
+  if (!result && neteaseId) {
     try {
       result = await bridge.neteaseLyric({ id: neteaseId })
+    } catch {
+      result = null
+    }
+  }
+  // 网易云也没有时，按歌名+歌手去 QQ 音乐找同一首歌的歌词
+  if ((!result || !result.lyric) && song.vendor !== 'tencent') {
+    try {
+      const found = await bridge.qqSearch({
+        keyword: `${baseName} ${artists[0] || ''}`.trim(),
+        limit: 20
+      })
+      const best = pickBest((found && found.list) || [], wantMs)
+      if (best && best.id) result = await bridge.qqLyric({ mid: best.id })
     } catch {
       result = null
     }

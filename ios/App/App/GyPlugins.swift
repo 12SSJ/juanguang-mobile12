@@ -163,16 +163,25 @@ public class GyHttpPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "GyHttpPlugin"
     public let jsName = "GyHttp"
     public let pluginMethods: [CAPPluginMethod] = [
-        CAPPluginMethod(name: "get", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "get", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "post", returnType: CAPPluginReturnPromise)
     ]
 
     @objc func get(_ call: CAPPluginCall) {
+        request(call, method: "GET", body: "")
+    }
+
+    @objc func post(_ call: CAPPluginCall) {
+        request(call, method: "POST", body: call.getString("body") ?? "")
+    }
+
+    private func request(_ call: CAPPluginCall, method: String, body: String) {
         guard let urlString = call.getString("url"), let url = URL(string: urlString) else {
             call.reject("缺少 url")
             return
         }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-        request.httpMethod = "GET"
+        request.httpMethod = method
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         let headers = call.getObject("headers") ?? [:]
         for (key, value) in headers {
@@ -180,15 +189,32 @@ public class GyHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                 request.setValue(text, forHTTPHeaderField: key)
             }
         }
+        if method == "POST" && !body.isEmpty {
+            request.httpBody = body.data(using: .utf8)
+        }
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 call.reject(error.localizedDescription)
                 return
             }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // 把响应头拍平（同名多值用换行分隔），前端靠 Set-Cookie 取会话
+            var headerMap: [String: String] = [:]
+            if let all = (response as? HTTPURLResponse)?.allHeaderFields {
+                for (key, value) in all {
+                    let name = String(describing: key)
+                    let text = String(describing: value)
+                    if let old = headerMap[name] {
+                        headerMap[name] = old + "\n" + text
+                    } else {
+                        headerMap[name] = text
+                    }
+                }
+            }
             call.resolve([
                 "status": status,
                 "contentType": response?.mimeType ?? "",
+                "headers": headerMap,
                 "data": (data ?? Data()).base64EncodedString()
             ])
         }.resume()
