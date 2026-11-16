@@ -27,6 +27,10 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
     private let defaultsExpireAt = "gy_license_expire_at"
     private let keychainService = "com.guangying.yueying.machine"
     private let keychainAccount = "machine_seed"
+    private let trialStartAccount = "trial_start"
+
+    /** 免费试用 2 天（48 小时） */
+    private let trialDuration: Double = 2 * 24 * 60 * 60 * 1000
 
     /** 时段索引、名称与月数（0 为永久） */
     private let licenseKeys = ["0", "1", "2", "3", "4", "5"]
@@ -71,9 +75,23 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
         let expired = matched && expireAt > 0 && nowMillis() >= expireAt
         let activated = matched && !expired
 
+        // 免费试用：首次打开（相当于安装）起 2 天，期间不拦截；激活后忽略试用
+        let now = nowMillis()
+        let trialStartAt = firstLaunchAt()
+        let trialEndAt = trialStartAt + trialDuration
+        let trialActive = !activated && now < trialEndAt
+        let trialExpired = !activated && !trialActive
+        let trialDaysLeft = trialActive ? Int(ceil((trialEndAt - now) / (24 * 60 * 60 * 1000))) : 0
+
         let result: [String: Any] = [
             "activated": activated,
             "expired": expired,
+            "trialActive": trialActive,
+            "trialExpired": trialExpired,
+            "trialStartAt": trialStartAt,
+            "trialEndAt": trialEndAt,
+            "trialEndText": formatDate(trialEndAt),
+            "trialDaysLeft": trialDaysLeft,
             "licenseType": matched ? licenseNames[index] : "",
             "activatedAt": activatedAt,
             "expireAt": matched ? expireAt : 0,
@@ -149,17 +167,27 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
     /* ---------------- Keychain 种子 ---------------- */
 
     private func machineSeed() -> String {
-        if let seed = keychainValue() { return seed }
+        if let seed = keychainValue(keychainAccount) { return seed }
         let seed = UUID().uuidString
-        keychainSet(seed)
+        keychainSet(seed, account: keychainAccount)
         return seed
     }
 
-    private func keychainValue() -> String? {
+    /// 首次打开时间存 Keychain（卸载重装后仍保留），作为免费试用起点
+    private func firstLaunchAt() -> Double {
+        if let text = keychainValue(trialStartAccount), let value = Double(text), value > 0 {
+            return value
+        }
+        let now = nowMillis()
+        keychainSet(String(now), account: trialStartAccount)
+        return now
+    }
+
+    private func keychainValue(_ account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -169,11 +197,11 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
         return String(data: data, encoding: .utf8)
     }
 
-    private func keychainSet(_ value: String) {
+    private func keychainSet(_ value: String, account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
+            kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
         var attributes = query

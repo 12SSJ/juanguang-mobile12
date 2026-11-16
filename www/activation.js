@@ -116,7 +116,9 @@
         <div class="gy-brand"><div class="gy-moon"></div><div class="gy-name">娟光月影</div></div>
         <div class="gy-sub">${state.expired
           ? `上次激活已于 ${state.expireText} 到期，请输入新的注册码重新激活。`
-          : '软件首次使用需要激活。请把下方机器码发送给管理员获取注册码，激活后即可正常使用。'}</div>
+          : state.trialExpired
+            ? `2 天免费试用已于 ${state.trialEndText} 结束，请输入注册码继续使用。`
+            : '软件首次使用需要激活。请把下方机器码发送给管理员获取注册码，激活后即可正常使用。'}</div>
         <div class="gy-label">本机机器码</div>
         <div class="gy-code">
           <div class="gy-code-text" id="gyMachineCode">${state.code}</div>
@@ -193,6 +195,11 @@
           return
         }
         if (state.activated) {
+          unmount()
+          return
+        }
+        // 安装后 2 天免费试用期内不拦截，到期后再弹注册页
+        if (state.trialActive) {
           unmount()
           return
         }
