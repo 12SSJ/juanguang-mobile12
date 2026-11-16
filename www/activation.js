@@ -114,7 +114,9 @@
     ensureOverlay().innerHTML = `
       <div class="gy-card">
         <div class="gy-brand"><div class="gy-moon"></div><div class="gy-name">娟光月影</div></div>
-        <div class="gy-sub">软件首次使用需要激活。请把下方机器码发送给管理员获取注册码，激活后即可正常使用。</div>
+        <div class="gy-sub">${state.expired
+          ? `上次激活已于 ${state.expireText} 到期，请输入新的注册码重新激活。`
+          : '软件首次使用需要激活。请把下方机器码发送给管理员获取注册码，激活后即可正常使用。'}</div>
         <div class="gy-label">本机机器码</div>
         <div class="gy-code">
           <div class="gy-code-text" id="gyMachineCode">${state.code}</div>
@@ -127,10 +129,10 @@
           state.brand || ''
         ].filter(Boolean).join(' · ')}</div>
         <div class="gy-label">注册码</div>
-        <input class="gy-input" id="gyCodeInput" placeholder="请输入注册码，如 3F2A-9C71-B0D4-2E88" autocomplete="off" spellcheck="false" />
+        <input class="gy-input" id="gyCodeInput" placeholder="请输入注册码，如 1-3F2A-9C71-B0D4-2E88" autocomplete="off" spellcheck="false" />
         <button class="gy-btn" id="gyActivateBtn">激活并开始使用</button>
         <div class="gy-err" id="gyErr"></div>
-        <div class="gy-tip">注册码与当前设备的 CPU、内存绑定的机器码唯一对应，换机或恢复出厂后需要重新注册。</div>
+        <div class="gy-tip">注册码与当前设备的 CPU、内存绑定的机器码唯一对应，换机或恢复出厂后需要重新注册。注册码可选 1 个月 / 3 个月 / 7 个月 / 1 年 / 3 年 / 永久，自激活当天起计算。</div>
       </div>`
 
     const input = document.getElementById('gyCodeInput')
@@ -153,7 +155,7 @@
         const res = await callNative('activate', { code: value })
         if (!res || !res.activated) throw new Error('激活失败')
         unmount()
-        toast('激活成功，欢迎使用娟光月影')
+        toast('激活成功 · ' + (res.licenseType || '') + '（' + (res.expireText || '永久有效') + '）')
       } catch (e) {
         err.textContent = (e && e.message) || '注册码不正确，请核对机器码后重新获取'
         btn.disabled = false

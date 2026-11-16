@@ -6,7 +6,9 @@ import Capacitor
 
 /* ---------------- 设备机器码与注册激活 ----------------
    机器码 = SHA-256(机型 | 线程数 | 物理内存 | IDFV | Keychain 种子) 前 16 位。
-   注册码算法与安卓/电脑版一致：SHA-256(机器码 | 固定密钥) 前 16 位。
+   注册码算法与安卓/电脑版一致：时段索引(1 位) + SHA-256(机器码 | 时段索引 | 固定密钥) 前 16 位，
+   展示为 X-XXXX-XXXX-XXXX-XXXX；时段：0 永久 1 一个月 2 三个月 3 七个月 4 一年 5 三年。
+   旧版 16 位注册码继续有效（视为永久）。
    IDFV 在卸载 App 后会变化，因此额外生成一个随机种子存进 Keychain，
    保证同一台设备重装后机器码依然稳定。 */
 
@@ -21,8 +23,15 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private let secret = "JGY-2026-MOONLIGHT"
     private let defaultsKey = "gy_license_code"
+    private let defaultsActivatedAt = "gy_license_activated_at"
+    private let defaultsExpireAt = "gy_license_expire_at"
     private let keychainService = "com.guangying.yueying.machine"
     private let keychainAccount = "machine_seed"
+
+    /** 时段索引、名称与月数（0 为永久） */
+    private let licenseKeys = ["0", "1", "2", "3", "4", "5"]
+    private let licenseNames = ["永久授权", "1 个月", "3 个月", "7 个月", "1 年", "3 年"]
+    private let licenseMonths = [0, 1, 3, 7, 12, 36]
 
     private struct MachineInfo {
         let code: String
@@ -33,17 +42,49 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func getActivationState(_ call: CAPPluginCall) {
         let info = machineInfo()
-        let saved = UserDefaults.standard.string(forKey: defaultsKey) ?? ""
-        let expected = expectedCode(machine: info.code)
-        let activated = !saved.isEmpty && normalize(saved) == normalize(expected)
-        call.resolve([
+        let defaults = UserDefaults.standard
+        var saved = normalize(defaults.string(forKey: defaultsKey) ?? "")
+        let index = matchLicense(machine: info.code, code: saved)
+        var activatedAt = defaults.double(forKey: defaultsActivatedAt)
+        var expireAt = defaults.double(forKey: defaultsExpireAt)
+
+        // 旧版 16 位注册码校验通过后自动升级为新格式（永久），用户无感知
+        if index == 0 && saved.count == 16 {
+            saved = normalize(expectedCode(machine: info.code, index: "0"))
+            if activatedAt <= 0 { activatedAt = nowMillis() }
+            defaults.set(saved, forKey: defaultsKey)
+            defaults.set(activatedAt, forKey: defaultsActivatedAt)
+            defaults.set(0, forKey: defaultsExpireAt)
+            expireAt = 0
+        }
+
+        // 有期限的码若缺少到期时间（老数据），按激活时间补算，避免误判为永久
+        if index > 0 && expireAt <= 0 {
+            let base = activatedAt > 0 ? activatedAt : nowMillis()
+            expireAt = addMonths(base, months: licenseMonths[index])
+            if activatedAt > 0 {
+                defaults.set(expireAt, forKey: defaultsExpireAt)
+            }
+        }
+
+        let matched = index >= 0
+        let expired = matched && expireAt > 0 && nowMillis() >= expireAt
+        let activated = matched && !expired
+
+        let result: [String: Any] = [
             "activated": activated,
+            "expired": expired,
+            "licenseType": matched ? licenseNames[index] : "",
+            "activatedAt": activatedAt,
+            "expireAt": matched ? expireAt : 0,
+            "expireText": matched ? (expireAt > 0 ? formatDate(expireAt) : "永久有效") : "",
             "code": info.code,
             "cpu": info.cpu,
             "cores": ProcessInfo.processInfo.processorCount,
             "memoryGb": String(format: "%.1f", info.memoryGb),
             "brand": info.brand
-        ])
+        ]
+        call.resolve(result)
     }
 
     @objc func activate(_ call: CAPPluginCall) {
@@ -53,13 +94,23 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let info = machineInfo()
-        let expected = normalize(expectedCode(machine: info.code))
-        if input != expected {
+        let index = matchLicense(machine: info.code, code: input)
+        if index < 0 {
             call.reject("注册码不正确，请核对机器码后重新获取")
             return
         }
-        UserDefaults.standard.set(input, forKey: defaultsKey)
-        call.resolve(["activated": true])
+        let now = nowMillis()
+        let expireAt = licenseMonths[index] == 0 ? 0 : addMonths(now, months: licenseMonths[index])
+        let defaults = UserDefaults.standard
+        defaults.set(input, forKey: defaultsKey)
+        defaults.set(now, forKey: defaultsActivatedAt)
+        defaults.set(expireAt, forKey: defaultsExpireAt)
+        call.resolve([
+            "activated": true,
+            "licenseType": licenseNames[index],
+            "expireAt": expireAt,
+            "expireText": expireAt > 0 ? formatDate(expireAt) : "永久有效"
+        ])
     }
 
     /* ---------------- 机器码 ---------------- */
@@ -133,18 +184,61 @@ public class GyDevicePlugin: CAPPlugin, CAPBridgedPlugin {
 
     /* ---------------- 授权算法 ---------------- */
 
-    private func expectedCode(machine: String) -> String {
+    /// 新注册码：时段索引 + SHA-256(机器码|时段索引|密钥) 前 16 位
+    private func expectedCode(machine: String, index: String) -> String {
+        formatCode(index + String(sha256Hex(normalize(machine) + "|" + index + "|" + secret).prefix(16)))
+    }
+
+    /// 旧版 16 位永久码，继续有效
+    private func legacyCode(machine: String) -> String {
         formatCode(String(sha256Hex(normalize(machine) + "|" + secret).prefix(16)))
+    }
+
+    /// 命中返回时段下标，未命中返回 -1
+    private func matchLicense(machine: String, code: String) -> Int {
+        if code.count == 17 {
+            for (index, key) in licenseKeys.enumerated() {
+                if code == normalize(expectedCode(machine: machine, index: key)) {
+                    return index
+                }
+            }
+            return -1
+        }
+        if code.count == 16 && code == normalize(legacyCode(machine: machine)) {
+            return 0
+        }
+        return -1
+    }
+
+    private func nowMillis() -> Double {
+        return Date().timeIntervalSince1970 * 1000
+    }
+
+    /// 按自然月累加（1 月 31 日 + 1 个月落到 2 月最后一天）
+    private func addMonths(_ base: Double, months: Int) -> Double {
+        let date = Date(timeIntervalSince1970: base / 1000)
+        let next = Calendar.current.date(byAdding: .month, value: months, to: date) ?? date
+        return next.timeIntervalSince1970 * 1000
+    }
+
+    private func formatDate(_ millis: Double) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.string(from: Date(timeIntervalSince1970: millis / 1000))
     }
 
     private func normalize(_ value: String) -> String {
         value.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
     }
 
-    private func formatCode(_ hex: String) -> String {
-        let upper = hex.uppercased()
-        guard upper.count >= 16 else { return upper }
-        let chars = Array(upper)
+    /// 17 位码按 X-4-4-4-4 分组，16 位码按 4-4-4-4 分组
+    private func formatCode(_ raw: String) -> String {
+        let chars = Array(raw.uppercased())
+        if chars.count >= 17 {
+            return "\(String(chars[0..<1]))-\(String(chars[1..<5]))-\(String(chars[5..<9]))-\(String(chars[9..<13]))-\(String(chars[13..<17]))"
+        }
+        guard chars.count >= 16 else { return raw.uppercased() }
         return "\(String(chars[0..<4]))-\(String(chars[4..<8]))-\(String(chars[8..<12]))-\(String(chars[12..<16]))"
     }
 
