@@ -9,6 +9,7 @@
   },
   "devDependencies": {
     "@capacitor/android": "8.5.3",
-    "@capacitor/cli": "8.5.3"
+    "@capacitor/cli": "8.5.3",
+    "javascript-obfuscator": "^5.10.1"
   }
 }
